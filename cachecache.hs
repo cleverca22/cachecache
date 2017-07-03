@@ -30,36 +30,6 @@ import qualified Data.HashMap.Strict as HM
 import   Control.Concurrent.STM
 
 type NarInfo = "subdir" :> Capture "storehash" String :> Get '[OctetStream] ByteString
-type UserAPI1 = "users" :> Get '[JSON] [User]
-
-type UserAPI2 = "users" :> Get '[JSON] [User]
-           :<|> "one" :> Get '[JSON] User
-
-data User = User
-  { name :: String
-  , age :: Int
-  , email :: String
-  , registration_date :: Day
-  } deriving (Eq, Show, Generic)
-
-instance ToJSON User
-
-
-users1 :: [User]
-users1 =
-  [ User "Isaac Newton"    372 "isaac@newton.co.uk" (fromGregorian 1683  3 1)
-  , User "Albert Einstein" 136 "ae@mc2.org"         (fromGregorian 1905 12 1)
-  ]
-
-one :: User
-one = User "Albert Einstein" 136 "ae@mc2.org"         (fromGregorian 1905 12 1)
-
-
-server1 :: Server UserAPI1
-server1 = return users1
-
-server2 :: Server UserAPI2
-server2 = return users1 :<|> return one
 
 handleNarInfo :: TVar (HM.HashMap Text ByteString)-> String -> Handler ByteString
 handleNarInfo narinfo_cache filename = let
