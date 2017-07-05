@@ -10,4 +10,9 @@ in stdenv.mkDerivation {
       ghc cachecache.hs -o cachecache -Wall
     }
   '';
+  src = ./.;
+  installPhase = ''
+    mkdir -p $out/bin/
+    ghc -Wall ./cachecache.hs -o $out/bin/cachecache
+  '';
 }
