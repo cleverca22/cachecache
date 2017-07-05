@@ -1,31 +1,38 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveDataTypeable  #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE PolyKinds           #-}
+{-# LANGUAGE DataKinds          #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE FlexibleContexts   #-}
+{-# LANGUAGE FlexibleInstances  #-}
+{-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE PolyKinds          #-}
+{-# LANGUAGE TypeOperators      #-}
 
 module Main (main) where
 
-import           Control.Concurrent.STM  (TVar, newTVarIO, readTVarIO, modifyTVar', atomically)
-import           Control.Monad           (when, forM_, (>=>))
-import           Control.Monad.ST        (ST)
-import           Control.Monad.Trans     (lift)
-import           Control.Lens            ((^.))
-import qualified Data.ByteString.Lazy    as LBS
-import           Data.Text               (Text, pack, stripSuffix)
-import qualified Data.Text.Lazy          as LT (Text, length, pack, unpack, stripSuffix)
-import           Data.Monoid             ((<>))
-import qualified Data.HashMap.Strict     as HM (HashMap, empty, lookup, insert)
-import           Debug.Trace             (trace)
-import           GHC.TypeLits            (KnownSymbol, Symbol, symbolVal)
-import qualified Network.Wreq            as Wreq
-import           Network.Wreq            (responseStatus, statusCode, responseBody, Response)
-import           Network.Wai             (Application)
+import           Control.Concurrent.STM
+                 (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
+import           Control.Lens             ((^.))
+import           Control.Monad            (forM_, when, (>=>))
+import           Control.Monad.ST         (ST)
+import           Control.Monad.Trans      (lift)
+import qualified Data.ByteString.Lazy     as LBS
+import qualified Data.HashMap.Strict      as HM (HashMap, empty, insert, lookup)
+import           Data.Monoid              ((<>))
+import           Data.Text                (Text, pack, stripSuffix)
+import qualified Data.Text.Lazy           as LT
+                 (Text, length, pack, stripSuffix, unpack)
+import           Debug.Trace              (trace)
+import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
+import           Network.Wai              (Application)
 import           Network.Wai.Handler.Warp (run)
-import           Servant                 (FromHttpApiData, Server, errBody, Handler, OctetStream, Get, (:>), (:<|>) (..), Capture, parseHeader, parseQueryParam, parseUrlPiece, Proxy(Proxy), err404, err500, throwError, serve)
+import           Network.Wreq
+                 (Response, responseBody, responseStatus, statusCode)
+import qualified Network.Wreq             as Wreq
+import           Servant
+                 ((:<|>) (..), (:>), Capture, FromHttpApiData, Get, Handler,
+                 OctetStream, Proxy (Proxy), Server, err404, err500, errBody,
+                 parseHeader, parseQueryParam, parseUrlPiece, serve,
+                 throwError)
 
 get :: LT.Text -> IO (Response LBS.ByteString)
 get txt = Wreq.get $ LT.unpack txt
@@ -51,7 +58,7 @@ parseExt str = res
       Nothing -> Left . pack $ "The filename \"" ++ str ++ "\" does not end with extension \"" ++ ext ++ "\""
       Just txt -> Right (Ext txt)
     ext = '.':getExt (toExtTy res)
-    
+
     toExtTy :: Either Text (Ext ext) -> Ext ext
     toExtTy _ = undefined
 
@@ -90,7 +97,7 @@ parseHash32 input = do
       -- j is the bit offset
       -- hash[i] = idx << j
     return undefined
-    
+
     trace (show maybeIdx) return undefined
   return undefined
 
