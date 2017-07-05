@@ -7,41 +7,37 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PolyKinds           #-}
 
-module Main where
+module Main (main) where
 
-import Data.Text
-import           Data.Text       (Text, pack, stripSuffix)
-import Data.Time (UTCTime)
-import Servant.API
-import Servant
-import Network.Wai (Application)
-import Network.Wai.Handler.Warp
-import Data.Aeson.Compat
-import Data.Aeson.Types
-import Data.Time.Calendar
-import GHC.Generics
-import Data.Monoid ((<>))
-import qualified Data.Text as T
-import           Control.Monad
-import           Network.Wreq (get, Response, responseStatus, statusCode, responseBody)
-import           Flow
-import qualified Data.ByteString.Lazy as LBS
-import           Control.Lens
-import           Control.Monad.Trans
-import qualified Data.Text.Encoding as T
-import qualified Data.Text.Lazy as LT
-import qualified Data.Text.Lazy.Encoding as LT
-import qualified Data.HashMap.Strict as HM
-import   Control.Concurrent.STM
-import           Data.Typeable   (Typeable)
-import           GHC.TypeLits
-import           Control.Monad.ST
-import           Control.Monad
-import           Data.List
-import           Debug.Trace
+import           Control.Concurrent.STM  (TVar, newTVarIO, readTVarIO, modifyTVar', atomically)
+import           Control.Monad           (when, forM_, (>=>))
+import           Control.Monad.ST        (ST)
+import           Control.Monad.Trans     (lift)
+import           Control.Lens            ((^.))
+import           Data.Aeson.Compat       ()
+import           Data.Aeson.Types        ()
+import qualified Data.ByteString.Lazy    as LBS
+import           Data.Text               (Text, pack, stripSuffix)
+import qualified Data.Text               as T ()
+import qualified Data.Text.Encoding      as T ()
+import qualified Data.Text.Lazy          as LT (Text, length, pack, unpack, stripSuffix)
+import qualified Data.Text.Lazy.Encoding as LT ()
+import           Data.Monoid             ((<>))
+import qualified Data.HashMap.Strict     as HM (HashMap, empty, lookup, insert)
+import           Data.List               ()
+import           Debug.Trace             (trace)
+import           GHC.TypeLits            (KnownSymbol, Symbol, symbolVal)
+import qualified Network.Wreq            as Wreq
+import           Network.Wreq            (responseStatus, statusCode, responseBody, Response)
+import           Network.Wai             (Application)
+import           Network.Wai.Handler.Warp (run)
+import           Servant                 (FromHttpApiData, Server, errBody, Handler, OctetStream, Get, (:>), (:<|>) (..), Capture, parseHeader, parseQueryParam, parseUrlPiece, Proxy(Proxy), err404, err500, throwError, serve)
+
+get :: LT.Text -> IO (Response LBS.ByteString)
+get txt = Wreq.get $ LT.unpack txt
 
 -- from https://github.com/haskell-servant/servant/pull/283
-newtype Ext (ext :: Symbol) = Ext { getFileName :: Text } deriving (Typeable, Eq, Ord, Show)
+newtype Ext (ext :: Symbol) = Ext { getFileName :: Text } deriving (Eq, Ord, Show)
 
 instance (KnownSymbol ext) => FromHttpApiData (Ext ext) where
   parseUrlPiece   = parseUrlPiece >=> parseExt
@@ -84,8 +80,10 @@ parseNarInfoPath str = res1
 type Base32 = LBS.ByteString
 parseHash32 :: LBS.ByteString -> ST s Base32
 parseHash32 input = do
-  let len = 32
-  let base32Chars = "0123456789abcdfghijklmnpqrsvwxyz"
+  let
+    len = 32
+    base32Chars :: LBS.ByteString
+    base32Chars = "0123456789abcdfghijklmnpqrsvwxyz"
   when (LBS.length input /= len) $ fail "wrong hash length"
   forM_ [ 0 .. len - 1 ] $ \n -> do
     let
@@ -103,44 +101,35 @@ parseHash32 input = do
   return undefined
 
 type NarInfoRequest = Capture "filename" NarInfoRestriction :> Get '[OctetStream] LBS.ByteString
-type NarRequest = Capture "filename" (Ext "nar") :> Get '[OctetStream] LBS.ByteString
-type TestRequest = "test" :> Capture "filename" NarInfoRestriction :> Get '[OctetStream] LBS.ByteString
+--type NarRequest = Capture "filename" (Ext "nar") :> Get '[OctetStream] LBS.ByteString
 
 type NarSubDir = "nar" :> Capture "filename" String :> Get '[OctetStream] LBS.ByteString
 
-type RootDir = NarInfoRequest :<|> NarRequest :<|> NarSubDir
+type RootDir = NarInfoRequest  :<|> NarSubDir
 
 handleNarInfo :: TVar (HM.HashMap LT.Text LBS.ByteString) -> NarInfoRestriction -> Handler LBS.ByteString
-handleNarInfo narinfo_cache hash = let
-      filename = textHash hash
-      checkNarInfo hash = do
-          when (LT.length hash /= 32) $ throwError myerr
-          rep <- lift $ (fetch narinfo_cache (NarInfo hash))
-          handle rep
-        where
-          url = "https://cache.nixos.org/" <> hash <> ".narinfo"
-          handle (Found bs) = return bs
-      myerr = err500 { errBody = "invalid query" }
-    in
-      checkNarInfo filename
-
-handleNar :: Ext "nar" -> Handler LBS.ByteString
-handleNar file = return "hello world"
-
-handleTest :: NarInfoRestriction -> Handler LBS.ByteString
-handleTest file = do
-  lift $ putStrLn $ show $ textHash file
-  return "hello world"
+handleNarInfo narinfo_cache narinfo_req = do
+    when (LT.length hash /= 32) $ throwError myerr
+    rep <- lift $ (fetch narinfo_cache (NarInfo hash))
+    case rep of
+      Found bs -> return bs
+      NotFound -> throwError $ err404 { errBody = "file not found" }
+      ServerError -> throwError $ err500 { errBody = "internal error" }
+  where
+    hash = textHash narinfo_req
+    myerr = err500 { errBody = "invalid query" }
 
 handleNarSubDir :: TVar (HM.HashMap LT.Text LBS.ByteString) -> String -> Handler LBS.ByteString
 handleNarSubDir narinfo_cache name = do
   res <- lift (fetch narinfo_cache $ Nar $ LT.pack $ "nar/" <> name)
   case res of
     Found lbs -> return lbs
+    NotFound -> throwError $ err404 { errBody = "file not found" }
+    ServerError -> throwError $ err500 { errBody = "internal error" }
 
 
 server3 :: TVar (HM.HashMap LT.Text LBS.ByteString) -> Server RootDir
-server3 narinfo_cache = (handleNarInfo narinfo_cache) :<|> handleNar :<|> (handleNarSubDir narinfo_cache)
+server3 narinfo_cache = (handleNarInfo narinfo_cache) :<|> (handleNarSubDir narinfo_cache)
 
 userAPI :: Proxy RootDir
 userAPI = Proxy
@@ -170,32 +159,25 @@ fetch narinfo_cache (NarInfo hash) = do
       return reply
 
 fetch _ (Nar path) = fetch' $ Nar path
+fetch _ CacheInfo = fetch' CacheInfo
 
 fetch' :: RequestType -> IO ReplyType
 fetch' CacheInfo = do
-    req <- get url
-    if req ^. responseStatus . statusCode == 200 then
-        return $ Found $ req ^. responseBody
-      else
-        return NotFound
-  where
-    url = "https://cache.nixos.org/nix-cache-info"
+  req <- get "https://cache.nixos.org/nix-cache-info"
+  return $ if req ^. responseStatus . statusCode == 200
+    then Found $ req ^. responseBody
+    else NotFound
+
 fetch' (NarInfo hash) = do
     putStrLn "fetching"
-    req <- get $ LT.unpack url
-    if req ^. responseStatus . statusCode == 200 then
-        return $ Found $ req ^. responseBody
-      else
-        return NotFound
-  where
-    url = "https://cache.nixos.org/" <> hash <> ".narinfo"
+    req <- get $ "https://cache.nixos.org/" <>  hash <> ".narinfo"
+    return $ if req ^. responseStatus . statusCode == 200
+      then Found $ req ^. responseBody
+      else NotFound
 
 fetch' (Nar path) = do
-    putStrLn $ "fetching " <> show path
-    req <- get $ LT.unpack url
-    if req ^. responseStatus . statusCode == 200 then
-        return $ Found $ req ^. responseBody
-      else
-        return NotFound
-  where
-    url = "https://cache.nixos.org/" <> path
+    putStrLn $ "fetching NAR " <> show path
+    req <- get $ "https://cache.nixos.org/" <> path
+    return $ if req ^. responseStatus . statusCode == 200
+      then Found $ req ^. responseBody
+      else NotFound
