@@ -10,7 +10,8 @@
 module Main (main) where
 
 import           Control.Concurrent.STM
-                 (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
+                 (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar,
+                 readTVarIO)
 import           Control.Lens             ((^.))
 import           Control.Monad            (forM_, when, (>=>))
 import           Control.Monad.ST         (ST)
@@ -34,8 +35,57 @@ import           Servant
                  parseHeader, parseQueryParam, parseUrlPiece, serve,
                  throwError)
 
+--------------------------------------------------------------------------------
+
+data NarInfoRestriction
+  = NarInfoRestriction
+    { rawHash  :: LBS.ByteString
+    , textHash :: LT.Text
+    }
+  deriving (Eq, Ord, Show)
+
+instance FromHttpApiData NarInfoRestriction where
+  parseUrlPiece   = parseUrlPiece >=> parseNarInfoPath
+  parseHeader     = parseHeader >=> parseNarInfoPath
+  parseQueryParam = parseQueryParam >=> parseNarInfoPath
+
+--------------------------------------------------------------------------------
+
+parseNarInfoPath :: String -> Either Text NarInfoRestriction
+parseNarInfoPath str = res1
+  where
+    res1 = case LT.stripSuffix ".narinfo" (LT.pack str) of
+      Nothing   -> Left . pack $ "The file doesnt end in .narinfo"
+      Just name -> if (LT.length name == 32)
+                    then Right $ NarInfoRestriction undefined name
+                    else Left . pack $ "The hash length is not 32"
+
+data CacheCache
+  = CacheCache
+    { narinfoCache :: !(TVar (HM.HashMap LT.Text LBS.ByteString))
+  }
+
+data RequestType
+  = CacheInfo
+  | NarInfo LT.Text
+  | Nar LT.Text
+  deriving Show
+data ReplyType
+  = Found LBS.ByteString
+  | NotFound
+  | ServerError
+  deriving Show
+
 get :: LT.Text -> IO (Response LBS.ByteString)
 get txt = Wreq.get $ LT.unpack txt
+
+lookupNarinfoCache :: CacheCache -> LT.Text -> STM (Maybe LBS.ByteString)
+lookupNarinfoCache cache key = do
+  hashmap <- readTVar (narinfoCache cache)
+  return $ HM.lookup key hashmap
+
+upsertNarinfoCache :: CacheCache -> LT.Text -> LBS.ByteString -> STM ()
+upsertNarinfoCache cache key value = modifyTVar' (narinfoCache cache) (HM.insert key value)
 
 -- from https://github.com/haskell-servant/servant/pull/283
 newtype Ext (ext :: Symbol) = Ext { getFileName :: Text } deriving (Eq, Ord, Show)
@@ -62,21 +112,6 @@ parseExt str = res
     toExtTy :: Either Text (Ext ext) -> Ext ext
     toExtTy _ = undefined
 
-data NarInfoRestriction = NarInfoRestriction { rawHash :: LBS.ByteString, textHash :: LT.Text } deriving (Eq, Ord, Show)
-instance FromHttpApiData NarInfoRestriction where
-  parseUrlPiece   = parseUrlPiece >=> parseNarInfoPath
-  parseHeader     = parseHeader >=> parseNarInfoPath
-  parseQueryParam = parseQueryParam >=> parseNarInfoPath
-parseNarInfoPath :: String -> Either Text NarInfoRestriction
-parseNarInfoPath str = res1
-  where
-    res1 = case LT.stripSuffix ".narinfo" (LT.pack str) of
-      Nothing -> Left . pack $ "The file doesnt end in .narinfo"
-      Just name -> res2 name
-    res2 name = if (LT.length name == 32) then
-        Right $ NarInfoRestriction undefined name
-      else
-        Left . pack $ "The hash length is not 32"
 
 type Base32 = LBS.ByteString
 parseHash32 :: LBS.ByteString -> ST s Base32
@@ -108,10 +143,10 @@ type NarSubDir = "nar" :> Capture "filename" String :> Get '[OctetStream] LBS.By
 
 type RootDir = NarInfoRequest  :<|> NarSubDir
 
-handleNarInfo :: TVar (HM.HashMap LT.Text LBS.ByteString) -> NarInfoRestriction -> Handler LBS.ByteString
-handleNarInfo narinfo_cache narinfo_req = do
+handleNarInfo :: CacheCache -> NarInfoRestriction -> Handler LBS.ByteString
+handleNarInfo cache narinfo_req = do
     when (LT.length hash /= 32) $ throwError myerr
-    rep <- lift $ (fetch narinfo_cache (NarInfo hash))
+    rep <- lift $ fetch cache $ NarInfo hash
     case rep of
       Found bs -> return bs
       NotFound -> throwError $ err404 { errBody = "file not found" }
@@ -120,42 +155,41 @@ handleNarInfo narinfo_cache narinfo_req = do
     hash = textHash narinfo_req
     myerr = err500 { errBody = "invalid query" }
 
-handleNarSubDir :: TVar (HM.HashMap LT.Text LBS.ByteString) -> String -> Handler LBS.ByteString
-handleNarSubDir narinfo_cache name = do
-  res <- lift (fetch narinfo_cache $ Nar $ LT.pack $ "nar/" <> name)
+handleNarSubDir :: CacheCache -> String -> Handler LBS.ByteString
+handleNarSubDir cache name = do
+  res <- lift $ fetch cache $ Nar $ LT.pack $ "nar/" <> name
   case res of
     Found lbs -> return lbs
     NotFound -> throwError $ err404 { errBody = "file not found" }
     ServerError -> throwError $ err500 { errBody = "internal error" }
 
 
-server3 :: TVar (HM.HashMap LT.Text LBS.ByteString) -> Server RootDir
-server3 narinfo_cache = (handleNarInfo narinfo_cache) :<|> (handleNarSubDir narinfo_cache)
+server3 :: CacheCache -> Server RootDir
+server3 cache = (handleNarInfo cache) :<|> (handleNarSubDir cache)
 
 userAPI :: Proxy RootDir
 userAPI = Proxy
 
-app1 :: TVar (HM.HashMap LT.Text LBS.ByteString)-> Application
-app1 narinfo_cache = serve userAPI $ server3 narinfo_cache
+app1 :: CacheCache -> Application
+app1 cache = serve userAPI $ server3 cache
 
 main :: IO ()
 main = do
-  narinfo_cache <- newTVarIO $ HM.empty
-  run 8081 $ app1 narinfo_cache
+  t1 <- newTVarIO $ HM.empty
+  let cache = CacheCache t1
+  run 8081 $ app1 cache
 
-data RequestType = CacheInfo | NarInfo LT.Text | Nar LT.Text deriving Show
-data ReplyType = Found LBS.ByteString | NotFound | ServerError deriving Show
-fetch :: TVar (HM.HashMap LT.Text LBS.ByteString) -> RequestType -> IO ReplyType
+fetch :: CacheCache -> RequestType -> IO ReplyType
 
-fetch narinfo_cache (NarInfo hash) = do
-  cache <- readTVarIO narinfo_cache
-  case HM.lookup hash cache of
+fetch cache (NarInfo hash) = do
+  maybeRes <- atomically $ lookupNarinfoCache cache hash
+  case maybeRes of
     (Just bs) -> return $ Found bs
     Nothing -> do
       reply <- fetch' (NarInfo hash)
       case reply of
         (Found bs) -> do
-          atomically $ modifyTVar' narinfo_cache (HM.insert hash bs)
+          atomically $ upsertNarinfoCache cache hash bs
         _ -> return ()
       return reply
 
