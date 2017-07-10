@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleContexts   #-}
 {-# LANGUAGE FlexibleInstances  #-}
 {-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE PackageImports     #-}
 {-# LANGUAGE PolyKinds          #-}
 {-# LANGUAGE TypeOperators      #-}
 
@@ -12,28 +13,49 @@ module Main (main) where
 import           Control.Concurrent.STM
                  (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar,
                  readTVarIO)
-import           Control.Lens             ((^.))
-import           Control.Monad            (forM_, when, (>=>))
+import           Control.Lens             (set, (^.))
+import           Control.Monad
 import           Control.Monad.ST         (ST)
-import           Control.Monad.Trans      (lift)
+import           Control.Monad.Trans      (MonadIO, lift)
+import qualified Data.ByteString          as BS hiding (hPutStrLn, pack)
+import qualified Data.ByteString.Char8    as BS (hPutStrLn, pack)
 import qualified Data.ByteString.Lazy     as LBS
-import qualified Data.HashMap.Strict      as HM (HashMap, empty, insert, lookup)
+import qualified Data.HashMap.Strict      as HM
+                 (HashMap, delete, empty, insert, lookup, size)
 import           Data.Monoid              ((<>))
 import           Data.Text                (Text, pack, stripSuffix)
 import qualified Data.Text.Lazy           as LT
                  (Text, length, pack, stripSuffix, unpack)
 import           Debug.Trace              (trace)
+import           GHC.Conc                 (unsafeIOToSTM)
 import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
 import           Network.Wai              (Application)
 import           Network.Wai.Handler.Warp (run)
 import           Network.Wreq
-                 (Response, responseBody, responseStatus, statusCode)
+                 (Response, checkResponse, defaults, getWith, responseBody,
+                 responseStatus, statusCode)
 import qualified Network.Wreq             as Wreq
 import           Servant
                  ((:<|>) (..), (:>), Capture, FromHttpApiData, Get, Handler,
-                 OctetStream, Proxy (Proxy), Server, err404, err500, errBody,
-                 parseHeader, parseQueryParam, parseUrlPiece, serve,
+                 OctetStream, Proxy (Proxy), Raw, Server, err404, err500,
+                 errBody, parseHeader, parseQueryParam, parseUrlPiece, serve,
                  throwError)
+
+import           "cryptonite" Crypto.Hash
+                 (Context, Digest, SHA256, hash, hashFinalize, hashInit,
+                 hashUpdate)
+import           Crypto.Hash.Algorithms   (SHA256)
+import           Pipes                    ((<-<), (<~), (>->), (>~), (~<), (~>))
+import qualified Pipes                    as P
+import qualified Pipes.ByteString         as PB
+import qualified Pipes.Prelude            as PP
+import           System.CPUTime           (getCPUTime)
+import           System.Exit              (exitSuccess)
+import           System.IO                (hPutStrLn, stderr)
+import           System.Posix.Signals     (installHandler, keyboardSignal)
+import qualified System.Posix.Signals     as Signals
+import           System.TimeIt
+import qualified Testing                  as T
 
 --------------------------------------------------------------------------------
 
@@ -60,9 +82,13 @@ parseNarInfoPath str = res1
                     then Right $ NarInfoRestriction undefined name
                     else Left . pack $ "The hash length is not 32"
 
+data NarInfoCacheEntry
+  = CacheHit { reply :: LBS.ByteString }
+  | CacheMiss { timestamp :: Double }
+
 data CacheCache
   = CacheCache
-    { narinfoCache :: !(TVar (HM.HashMap LT.Text LBS.ByteString))
+    { narinfoCache :: !(TVar (HM.HashMap LT.Text NarInfoCacheEntry))
   }
 
 data RequestType
@@ -76,15 +102,37 @@ data ReplyType
   | ServerError
   deriving Show
 
-get :: LT.Text -> IO (Response LBS.ByteString)
-get txt = Wreq.get $ LT.unpack txt
+getNoThrow :: LT.Text -> IO (Response LBS.ByteString)
+getNoThrow url = getWith (set checkResponse (Just $ \_ _ -> return ()) defaults) (LT.unpack url)
 
-lookupNarinfoCache :: CacheCache -> LT.Text -> STM (Maybe LBS.ByteString)
+class LogStream a where
+  logMsg :: a -> IO ()
+
+instance LogStream BS.ByteString where
+  logMsg msg = BS.hPutStrLn stderr msg
+
+instance LogStream String where
+  logMsg msg = logMsg (BS.pack msg)
+
+lookupNarinfoCache :: CacheCache -> LT.Text -> STM (Maybe NarInfoCacheEntry)
 lookupNarinfoCache cache key = do
   hashmap <- readTVar (narinfoCache cache)
-  return $ HM.lookup key hashmap
+  let
+    value = HM.lookup key hashmap
+  case value of
+    (Just (CacheMiss timestamp)) -> do
+      now <- unsafeIOToSTM $ getCPUTime
+      let
+        age = (fromIntegral now * 1e-12) - timestamp
+      if age > 60 then do
+        modifyTVar' (narinfoCache cache) (HM.delete key)
+        return Nothing
+      else
+        return value
+    _ -> return value
 
-upsertNarinfoCache :: CacheCache -> LT.Text -> LBS.ByteString -> STM ()
+
+upsertNarinfoCache :: CacheCache -> LT.Text -> NarInfoCacheEntry -> STM ()
 upsertNarinfoCache cache key value = modifyTVar' (narinfoCache cache) (HM.insert key value)
 
 -- from https://github.com/haskell-servant/servant/pull/283
@@ -140,8 +188,9 @@ type NarInfoRequest = Capture "filename" NarInfoRestriction :> Get '[OctetStream
 --type NarRequest = Capture "filename" (Ext "nar") :> Get '[OctetStream] LBS.ByteString
 
 type NarSubDir = "nar" :> Capture "filename" String :> Get '[OctetStream] LBS.ByteString
+type NixCacheInfo = "nix-cache-info" :> Get '[OctetStream] LBS.ByteString
+type UserAPI1 = "users" :> Raw
 
-type RootDir = NarInfoRequest  :<|> NarSubDir
 
 handleNarInfo :: CacheCache -> NarInfoRestriction -> Handler LBS.ByteString
 handleNarInfo cache narinfo_req = do
@@ -163,9 +212,14 @@ handleNarSubDir cache name = do
     NotFound -> throwError $ err404 { errBody = "file not found" }
     ServerError -> throwError $ err500 { errBody = "internal error" }
 
+handleNixCacheInfo :: Handler LBS.ByteString
+handleNixCacheInfo = return "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"
+
+
+type RootDir = NarInfoRequest :<|> NarSubDir :<|> NixCacheInfo :<|> UserAPI1
 
 server3 :: CacheCache -> Server RootDir
-server3 cache = (handleNarInfo cache) :<|> (handleNarSubDir cache)
+server3 cache = (handleNarInfo cache) :<|> (handleNarSubDir cache) :<|> handleNixCacheInfo :<|> T.foo
 
 userAPI :: Proxy RootDir
 userAPI = Proxy
@@ -177,19 +231,28 @@ main :: IO ()
 main = do
   t1 <- newTVarIO $ HM.empty
   let cache = CacheCache t1
-  run 8081 $ app1 cache
+  installHandler keyboardSignal (Signals.Catch (do exitSuccess)) Nothing
+  run 8083 $ app1 cache
 
 fetch :: CacheCache -> RequestType -> IO ReplyType
 
 fetch cache (NarInfo hash) = do
-  maybeRes <- atomically $ lookupNarinfoCache cache hash
+  (spent, maybeRes) <- timeItT $ atomically $ lookupNarinfoCache cache hash
+  logMsg $ "cache lookup took " <> show spent
   case maybeRes of
-    (Just bs) -> return $ Found bs
+    (Just (CacheHit body)) -> return $ Found body
+    (Just (CacheMiss timestamp)) -> return NotFound
     Nothing -> do
+      map <- atomically $ readTVar $ narinfoCache cache
+      logMsg $ "cache miss, cache size: " <> (show $ HM.size map)
       reply <- fetch' (NarInfo hash)
       case reply of
         (Found bs) -> do
-          atomically $ upsertNarinfoCache cache hash bs
+          atomically $ upsertNarinfoCache cache hash $ CacheHit bs
+        NotFound -> do
+          now <- getCPUTime
+          atomically $ upsertNarinfoCache cache hash $ CacheMiss (fromIntegral now * 1e-12)
+          return ()
         _ -> return ()
       return reply
 
@@ -198,21 +261,52 @@ fetch _ CacheInfo = fetch' CacheInfo
 
 fetch' :: RequestType -> IO ReplyType
 fetch' CacheInfo = do
-  req <- get "https://cache.nixos.org/nix-cache-info"
+  req <- getNoThrow "https://cache.nixos.org/nix-cache-info"
   return $ if req ^. responseStatus . statusCode == 200
     then Found $ req ^. responseBody
     else NotFound
 
 fetch' (NarInfo hash) = do
-    putStrLn "fetching"
-    req <- get $ "https://cache.nixos.org/" <>  hash <> ".narinfo"
+    (spent, req) <- timeItT $ getNoThrow $ "https://cache.nixos.org/" <>  hash <> ".narinfo"
+    logMsg $ "fetching info " <> show hash <> " took " <> show spent
     return $ if req ^. responseStatus . statusCode == 200
       then Found $ req ^. responseBody
       else NotFound
 
 fetch' (Nar path) = do
-    putStrLn $ "fetching NAR " <> show path
-    req <- get $ "https://cache.nixos.org/" <> path
+    (spent, req) <- timeItT $ getNoThrow $ "https://cache.nixos.org/" <> path
+    let
+      size = LBS.length $ req ^. responseBody
+    logMsg $ "fetching NAR " <> show path <> " took " <> show spent <> " rate " <> show (floor ((fromIntegral size) / spent / 1024)) <> " kbytes/second"
     return $ if req ^. responseStatus . statusCode == 200
       then Found $ req ^. responseBody
       else NotFound
+
+
+data Chunk = EOF | Chunk !BS.ByteString
+
+foo :: (Monad m) => Context SHA256 -> P.Pipe Chunk (Digest SHA256) m r
+foo ctx = do
+  chunk <- P.await
+  case chunk of
+    EOF -> do
+      P.yield (hashFinalize ctx)
+      bar
+    Chunk bs -> do
+      foo (hashUpdate ctx bs)
+
+bar :: (Monad m) => P.Pipe Chunk (Digest SHA256) m r
+bar = do
+  let
+    ctx = hashInit
+  foo ctx
+  bar
+
+
+baz :: IO ()
+baz = do
+  P.runEffect ((P.yield (Chunk "foobar") >> P.yield (Chunk "lmao") >> P.yield EOF) >-> bar >-> PP.print)
+
+qux :: IO ()
+qux = do
+  putStrLn $ show (hash ("foobarlmao"::BS.ByteString) :: Digest SHA256)
