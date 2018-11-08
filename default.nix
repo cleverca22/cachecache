@@ -4,7 +4,7 @@ let
   ghc = haskellPackages.ghcWithPackages (ps: with ps; [ aeson-compat servant-server wai warp wreq flow bits-bytestring pipes-wai pipes-bytestring pipes-concurrency pipes-async async pipes cryptonite haxl timeit ]);
 in stdenv.mkDerivation {
   name = "cachecache";
-  buildInputs = [ ghc ] ++ (with haskellPackages; [ stylish-haskell ghcid ]);
+  buildInputs = [ ghc ] ++ (with haskellPackages; [ stylish-haskell ghcid hlint ]);
   shellHook = ''
     buildAll() {
       ghc cachecache.hs -o cachecache -Wall

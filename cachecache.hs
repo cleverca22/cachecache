@@ -1,6 +1,4 @@
 {-# LANGUAGE DataKinds          #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE FlexibleContexts   #-}
 {-# LANGUAGE FlexibleInstances  #-}
 {-# LANGUAGE OverloadedStrings  #-}
@@ -82,7 +80,7 @@ parseNarInfoPath str = res1
   where
     res1 = case LT.stripSuffix ".narinfo" (LT.pack str) of
       Nothing   -> Left . pack $ "The file doesnt end in .narinfo"
-      Just name -> if (LT.length name == 32)
+      Just name -> if LT.length name == 32
                     then Right $ NarInfoRestriction undefined name
                     else Left . pack $ "The hash length is not 32"
 
@@ -90,7 +88,7 @@ data NarInfoCacheEntry
   = CacheHit { reply :: LBS.ByteString }
   | CacheMiss { timestamp :: Double }
 
-data CacheCache
+newtype CacheCache
   = CacheCache
     { narinfoCache :: !(TVar (HM.HashMap LT.Text NarInfoCacheEntry))
   }
@@ -113,7 +111,7 @@ class LogStream a where
   logMsg :: a -> IO ()
 
 instance LogStream BS.ByteString where
-  logMsg msg = BS.hPutStrLn stderr msg
+  logMsg = BS.hPutStrLn stderr
 
 instance LogStream String where
   logMsg msg = logMsg (BS.pack msg)
@@ -125,7 +123,7 @@ lookupNarinfoCache cache key = do
     value = HM.lookup key hashmap
   case value of
     (Just (CacheMiss timestamp)) -> do
-      now <- unsafeIOToSTM $ getCPUTime
+      now <- unsafeIOToSTM getCPUTime
       let
         age = (fromIntegral now * 1e-12) - timestamp
       if age > 60 then do
@@ -183,7 +181,6 @@ parseHash32 input = do
       -- i is the byte position
       -- j is the bit offset
       -- hash[i] = idx << j
-    return undefined
 
     trace (show maybeIdx) return undefined
   return undefined
@@ -228,7 +225,7 @@ shutdownHandler shutdownMVar = do
 type RootDir = NarInfoRequest :<|> NarSubDir :<|> NixCacheInfo :<|> UserAPI1 :<|> ShutdownUrl
 
 server3 :: CacheCache -> MVar () -> Server RootDir
-server3 cache shutdownMVar = (handleNarInfo cache) :<|> (handleNarSubDir cache) :<|> handleNixCacheInfo :<|> T.foo :<|> (shutdownHandler shutdownMVar)
+server3 cache shutdownMVar = handleNarInfo cache :<|> handleNarSubDir cache :<|> handleNixCacheInfo :<|> T.foo :<|> shutdownHandler shutdownMVar
 
 userAPI :: Proxy RootDir
 userAPI = Proxy
@@ -237,13 +234,13 @@ app1 :: CacheCache -> MVar () -> Application
 app1 cache shutdownMVar = serve userAPI $ server3 cache shutdownMVar
 
 startHelper :: CacheCache -> MVar () -> IO ()
-startHelper cache shutdownMVar = do
+startHelper cache shutdownMVar =
     catch (run port $ app1 cache shutdownMVar) handler
   where
     port = 8081
     handler e = do
-      logMsg $ "exception!: " <> (show (e :: IOError))
-      logMsg $ "t1: " <> (show (isAlreadyInUseError e))
+      logMsg $ "exception!: " <> show (e :: IOError)
+      logMsg $ "t1: " <> show (isAlreadyInUseError e)
       if isAlreadyInUseError e
         then do
           _ <- getNoThrow (LT.pack ("http://localhost:" <> show port <> "/shutdown"))
@@ -253,7 +250,7 @@ startHelper cache shutdownMVar = do
 
 main :: IO ()
 main = do
-  t1 <- newTVarIO $ HM.empty
+  t1 <- newTVarIO HM.empty
   shutdownMVar <- newEmptyMVar
   let cache = CacheCache t1
   forkIO $ startHelper cache shutdownMVar
@@ -271,11 +268,11 @@ fetch cache (NarInfo hash) = do
     (Just (CacheHit body)) -> return $ Found body
     (Just (CacheMiss timestamp)) -> return NotFound
     Nothing -> do
-      map <- atomically $ readTVar $ narinfoCache cache
-      logMsg $ "cache miss, cache size: " <> (show $ HM.size map)
+      map <- readTVarIO $ narinfoCache cache
+      logMsg $ "cache miss, cache size: " <> show (HM.size map)
       reply <- fetch' (NarInfo hash)
       case reply of
-        (Found bs) -> do
+        Found bs ->
           atomically $ upsertNarinfoCache cache hash $ CacheHit bs
         NotFound -> do
           now <- getCPUTime
@@ -305,7 +302,7 @@ fetch' (Nar path) = do
     (spent, req) <- timeItT $ getNoThrow $ "https://cache.nixos.org/" <> path
     let
       size = LBS.length $ req ^. responseBody
-    logMsg $ "fetching NAR " <> show path <> " took " <> show spent <> " rate " <> show (floor ((fromIntegral size) / spent / 1024)) <> " kbytes/second"
+    logMsg $ "fetching NAR " <> show path <> " took " <> show spent <> " rate " <> show (floor (fromIntegral size / spent / 1024)) <> " kbytes/second"
     return $ if req ^. responseStatus . statusCode == 200
       then Found $ req ^. responseBody
       else NotFound
@@ -320,7 +317,7 @@ foo ctx = do
     EOF -> do
       P.yield (hashFinalize ctx)
       bar
-    Chunk bs -> do
+    Chunk bs ->
       foo (hashUpdate ctx bs)
 
 bar :: (Monad m) => P.Pipe Chunk (Digest SHA256) m r
@@ -332,9 +329,9 @@ bar = do
 
 
 baz :: IO ()
-baz = do
+baz =
   P.runEffect ((P.yield (Chunk "foobar") >> P.yield (Chunk "lmao") >> P.yield EOF) >-> bar >-> PP.print)
 
 qux :: IO ()
-qux = do
-  putStrLn $ show (hash ("foobarlmao"::BS.ByteString) :: Digest SHA256)
+qux =
+  print $ show (hash ("foobarlmao"::BS.ByteString) :: Digest SHA256)
