@@ -13,7 +13,6 @@ module Main (main, rateToString) where
 import           Control.Concurrent.STM
                  (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar,
                  readTVarIO)
-import           Control.Lens             (set, (^.))
 import           Control.Monad
 import           Control.Monad.ST         (ST)
 import           Control.Monad.Trans      (liftIO)
@@ -33,11 +32,9 @@ import           GHC.Conc                 (unsafeIOToSTM, forkIO, threadDelay, k
 import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
 import           Network.Wai              (Application)
 import           Network.Wai.Handler.Warp (run)
-import           Network.Wreq
-                 (Response, checkResponse, defaults, getWith, responseBody,
-                 responseStatus, statusCode)
 import           Network.HTTP.Client.TLS  (tlsManagerSettings)
-import           Network.HTTP.Client      (newManager, Manager, parseRequest, httpLbs, method, host, path, defaultRequest, secure, port)
+import           Network.HTTP.Client      (newManager, Manager, parseRequest, httpLbs, method, host, path, defaultRequest, secure, port, Response, responseStatus, responseBody)
+import           Network.HTTP.Types.Status (statusCode)
 import           Servant
                  ((:<|>) (..), (:>), Capture, FromHttpApiData, Get, Handler,
                  OctetStream, Proxy (Proxy), Raw, Server, err404, err500,
@@ -319,8 +316,8 @@ rateToString size spent = do
 fetch' :: CacheCache -> RequestType -> IO ReplyType
 fetch' cache CacheInfo = do
   req <- getNoThrow (manager cache) (True, "cache.nixos.org", 443, "/nix-cache-info")
-  return $ if req ^. responseStatus . statusCode == 200
-    then Found $ req ^. responseBody
+  return $ if ((statusCode . responseStatus) req) == 200
+    then Found $ responseBody req
     else NotFound
 
 fetch' cache (NarInfo hash') = do
@@ -331,8 +328,8 @@ fetch' cache (NarInfo hash') = do
         (secure, domain, port, CacheNarSub) = next
       (spent, req) <- timeItT $ getNoThrow (manager cache) (secure, domain, port, "/" <> hash' <> ".narinfo")
       logMsg $ "fetching info " <> show hash' <> " took " <> show spent
-      if req ^. responseStatus . statusCode == 200
-        then return $ Found $ req ^. responseBody
+      if (statusCode . responseStatus) req == 200
+        then return $ Found $ responseBody req
         else go rest
     go [] = return NotFound
   req <- go (upstreamCaches cache)
@@ -346,10 +343,10 @@ fetch' cache (Nar path) = do
         (secure, domain, port, CacheNarSub) = next
       (spent, req) <- timeItT $ getNoThrow (manager cache) $ (secure, domain, port, "/nar/" <> path)
       let
-        size = LBS.length $ req ^. responseBody
+        size = LBS.length $ responseBody req
       logMsg $ "fetching NAR " <> show path <> " took " <> show spent <> " rate " <> rateToString size spent
-      if req ^. responseStatus . statusCode == 200
-        then return $ Found $ req ^. responseBody
+      if (statusCode . responseStatus) req == 200
+        then return $ Found $ responseBody req
         else go rest
     go [] = return NotFound
   req <- go (upstreamCaches cache)
