@@ -90,7 +90,7 @@ data NarInfoCacheEntry
 
 newtype CacheCache
   = CacheCache
-    { narinfoCache :: !(TVar (HM.HashMap LT.Text NarInfoCacheEntry))
+    { narinfoCache :: TVar (HM.HashMap LT.Text NarInfoCacheEntry)
   }
 
 data RequestType
