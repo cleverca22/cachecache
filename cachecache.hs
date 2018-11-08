@@ -7,6 +7,7 @@
 {-# LANGUAGE PackageImports     #-}
 {-# LANGUAGE PolyKinds          #-}
 {-# LANGUAGE TypeOperators      #-}
+{-# LANGUAGE TypeApplications   #-}
 
 module Main (main) where
 
@@ -17,6 +18,8 @@ import           Control.Lens             (set, (^.))
 import           Control.Monad
 import           Control.Monad.ST         (ST)
 import           Control.Monad.Trans      (MonadIO, lift)
+import Control.Exception (catch, IOException)
+import Control.Concurrent.MVar
 import qualified Data.ByteString          as BS hiding (hPutStrLn, pack)
 import qualified Data.ByteString.Char8    as BS (hPutStrLn, pack)
 import qualified Data.ByteString.Lazy     as LBS
@@ -27,7 +30,7 @@ import           Data.Text                (Text, pack, stripSuffix)
 import qualified Data.Text.Lazy           as LT
                  (Text, length, pack, stripSuffix, unpack)
 import           Debug.Trace              (trace)
-import           GHC.Conc                 (unsafeIOToSTM)
+import           GHC.Conc                 (unsafeIOToSTM, forkIO, threadDelay)
 import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
 import           Network.Wai              (Application)
 import           Network.Wai.Handler.Warp (run)
@@ -56,6 +59,7 @@ import           System.Posix.Signals     (installHandler, keyboardSignal)
 import qualified System.Posix.Signals     as Signals
 import           System.TimeIt
 import qualified Testing                  as T
+import System.IO.Error
 
 --------------------------------------------------------------------------------
 
@@ -189,6 +193,7 @@ type NarInfoRequest = Capture "filename" NarInfoRestriction :> Get '[OctetStream
 
 type NarSubDir = "nar" :> Capture "filename" String :> Get '[OctetStream] LBS.ByteString
 type NixCacheInfo = "nix-cache-info" :> Get '[OctetStream] LBS.ByteString
+type ShutdownUrl = "shutdown" :> Get '[OctetStream] LBS.ByteString
 type UserAPI1 = "users" :> Raw
 
 
@@ -215,30 +220,53 @@ handleNarSubDir cache name = do
 handleNixCacheInfo :: Handler LBS.ByteString
 handleNixCacheInfo = return "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"
 
+shutdownHandler :: MVar () -> Handler LBS.ByteString
+shutdownHandler shutdownMVar = do
+  lift $ putMVar shutdownMVar ()
+  return "done"
 
-type RootDir = NarInfoRequest :<|> NarSubDir :<|> NixCacheInfo :<|> UserAPI1
+type RootDir = NarInfoRequest :<|> NarSubDir :<|> NixCacheInfo :<|> UserAPI1 :<|> ShutdownUrl
 
-server3 :: CacheCache -> Server RootDir
-server3 cache = (handleNarInfo cache) :<|> (handleNarSubDir cache) :<|> handleNixCacheInfo :<|> T.foo
+server3 :: CacheCache -> MVar () -> Server RootDir
+server3 cache shutdownMVar = (handleNarInfo cache) :<|> (handleNarSubDir cache) :<|> handleNixCacheInfo :<|> T.foo :<|> (shutdownHandler shutdownMVar)
 
 userAPI :: Proxy RootDir
 userAPI = Proxy
 
-app1 :: CacheCache -> Application
-app1 cache = serve userAPI $ server3 cache
+app1 :: CacheCache -> MVar () -> Application
+app1 cache shutdownMVar = serve userAPI $ server3 cache shutdownMVar
+
+startHelper :: CacheCache -> MVar () -> IO ()
+startHelper cache shutdownMVar = do
+    catch (run port $ app1 cache shutdownMVar) handler
+  where
+    port = 8081
+    handler e = do
+      logMsg $ "exception!: " <> (show (e :: IOError))
+      logMsg $ "t1: " <> (show (isAlreadyInUseError e))
+      if isAlreadyInUseError e
+        then do
+          _ <- getNoThrow (LT.pack ("http://localhost:" <> show port <> "/shutdown"))
+          threadDelay $ 5 * 1000 * 1000
+          startHelper cache shutdownMVar
+        else putMVar shutdownMVar ()
 
 main :: IO ()
 main = do
   t1 <- newTVarIO $ HM.empty
+  shutdownMVar <- newEmptyMVar
   let cache = CacheCache t1
-  installHandler keyboardSignal (Signals.Catch (do exitSuccess)) Nothing
-  run 8083 $ app1 cache
+  forkIO $ startHelper cache shutdownMVar
+  takeMVar shutdownMVar
+  logMsg @String "shutting down..."
+  threadDelay $ 1000  * 1000
+  logMsg @String "down"
 
 fetch :: CacheCache -> RequestType -> IO ReplyType
 
 fetch cache (NarInfo hash) = do
   (spent, maybeRes) <- timeItT $ atomically $ lookupNarinfoCache cache hash
-  logMsg $ "cache lookup took " <> show spent
+  --logMsg $ "cache lookup took " <> show spent
   case maybeRes of
     (Just (CacheHit body)) -> return $ Found body
     (Just (CacheMiss timestamp)) -> return NotFound
