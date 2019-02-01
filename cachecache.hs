@@ -31,7 +31,7 @@ import           Debug.Trace              (trace)
 import           GHC.Conc                 (unsafeIOToSTM, forkIO, threadDelay, killThread)
 import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
 import           Network.Wai              (Application)
-import           Network.Wai.Handler.Warp (run)
+import           Network.Wai.Handler.Warp (run, defaultSettings, setPort, runSettings, setTimeout)
 import           Network.HTTP.Client.TLS  (tlsManagerSettings)
 import           Network.HTTP.Client      (newManager, Manager, parseRequest, httpLbs, method, host, path, defaultRequest, secure, port, Response, responseStatus, responseBody)
 import           Network.HTTP.Types.Status (statusCode)
@@ -236,8 +236,9 @@ app1 cache shutdownMVar = serve userAPI $ server3 cache shutdownMVar
 
 startHelper :: CacheCache -> MVar () -> IO ()
 startHelper cache shutdownMVar =
-    catch (run port $ app1 cache shutdownMVar) handler
+    catch (runSettings settings $ app1 cache shutdownMVar) handler
   where
+    settings = setTimeout 600 $ setPort port $ defaultSettings
     port = 8081
     handler e = do
       logMsg $ "exception!: " <> show (e :: IOError)
@@ -275,11 +276,15 @@ fetch cache (NarInfo hash') = do
   (spent, maybeRes) <- timeItT $ atomically $ lookupNarinfoCache cache hash'
   logMsg $ "cache lookup took " <> show spent
   case maybeRes of
-    (Just (CacheHit body)) -> return $ Found body
-    (Just (CacheMiss _)) -> return NotFound
+    (Just (CacheHit body)) -> do
+      logMsg @String "cache hit hit"
+      return $ Found body
+    (Just (CacheMiss _)) -> do
+      logMsg @String "cache hit miss"
+      return NotFound
     Nothing -> do
       map' <- readTVarIO $ narinfoCache cache
-      --logMsg $ "cache miss, cache size: " <> show (HM.size map')
+      logMsg @String "cache miss" -- , cache size: " <> show (HM.size map')
       reply <- fetch' cache (NarInfo hash')
       case reply of
         Found bs ->
