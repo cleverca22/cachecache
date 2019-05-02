@@ -2,7 +2,6 @@
 {-# LANGUAGE FlexibleContexts   #-}
 {-# LANGUAGE FlexibleInstances  #-}
 {-# LANGUAGE OverloadedStrings  #-}
-{-# LANGUAGE PackageImports     #-}
 {-# LANGUAGE PolyKinds          #-}
 {-# LANGUAGE TypeOperators      #-}
 {-# LANGUAGE TypeApplications   #-}
@@ -11,44 +10,36 @@
 module Main (main, rateToString) where
 
 import           Control.Concurrent.STM
-                 (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar,
-                 readTVarIO)
+                 (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar)
 import           Control.Monad
-import           Control.Monad.ST         (ST)
 import           Control.Monad.Trans      (liftIO)
 import           Control.Exception        (catch)
 import           Control.Concurrent.MVar  (MVar, putMVar, takeMVar, newEmptyMVar)
 import qualified Data.ByteString          as BS hiding (hPutStrLn, pack)
 import qualified Data.ByteString.Lazy     as LBS
 import qualified Data.HashMap.Strict      as HM
-                 (HashMap, delete, empty, insert, lookup, size)
+                 (HashMap, delete, empty, insert, lookup)
 import           Data.Monoid              ((<>))
 import           Data.Text                (Text, pack, stripSuffix)
 import qualified Data.Text.Lazy           as LT
                  (Text, length, pack, stripSuffix, unpack)
 import qualified Data.Text.Lazy.Encoding  as LT
-import           Debug.Trace              (trace)
+--import           Debug.Trace              (trace)
 import           GHC.Conc                 (unsafeIOToSTM, forkIO, threadDelay, killThread)
 import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
 import           Network.Wai              (Application)
-import           Network.Wai.Handler.Warp (run, defaultSettings, setPort, runSettings, setTimeout)
+import           Network.Wai.Handler.Warp (defaultSettings, setPort, runSettings, setTimeout)
 import           Network.HTTP.Client.TLS  (tlsManagerSettings)
-import           Network.HTTP.Client      (newManager, Manager, parseRequest, httpLbs, method, host, path, defaultRequest, secure, port, Response, responseStatus, responseBody)
+import           Network.HTTP.Client      (newManager, Manager, httpLbs, host, path, defaultRequest, secure, port, Response, responseStatus, responseBody)
 import           Network.HTTP.Types.Status (statusCode)
 import           Servant
                  ((:<|>) (..), (:>), Capture, FromHttpApiData, Get, Handler,
-                 OctetStream, Proxy (Proxy), Raw, Server, err404, err500,
+                 OctetStream, Proxy (Proxy), Server, err404, err500,
                  errBody, parseHeader, parseQueryParam, parseUrlPiece, serve,
                  throwError)
 
-import           "cryptonite" Crypto.Hash
-                 (Context, Digest, SHA256, hash, hashFinalize, hashInit,
-                 hashUpdate)
 --import           Crypto.Hash.Algorithms   (SHA256)
-import           Pipes                    ((<-<), (<~), (>->), (>~), (~<), (~>))
-import qualified Pipes                    as P
 --import qualified Pipes.ByteString         as PB
-import qualified Pipes.Prelude            as PP
 import           System.CPUTime           (getCPUTime)
 --import           System.Posix.Signals     (installHandler, keyboardSignal)
 --import qualified System.Posix.Signals     as Signals
@@ -166,36 +157,13 @@ parseExt str = res
     toExtTy :: Either Text (Ext ext) -> Ext ext
     toExtTy _ = undefined
 
-
-type Base32 = LBS.ByteString
-parseHash32 :: LBS.ByteString -> ST s Base32
-parseHash32 input = do
-  let
-    len = 32
-    base32Chars :: LBS.ByteString
-    base32Chars = "0123456789abcdfghijklmnpqrsvwxyz"
-  when (LBS.length input /= len) $ fail "wrong hash length"
-  forM_ [ 0 .. len - 1 ] $ \n -> do
-    let
-      c = LBS.index input n
-      maybeIdx = LBS.elemIndex c base32Chars
-      b = n * 5
-      i = div b 8
-      j = mod b 8
-      -- i is the byte position
-      -- j is the bit offset
-      -- hash[i] = idx << j
-
-    trace (show maybeIdx) return undefined
-  return undefined
-
 type NarInfoRequest = Capture "filename" NarInfoRestriction :> Get '[OctetStream] LBS.ByteString
 --type NarRequest = Capture "filename" (Ext "nar") :> Get '[OctetStream] LBS.ByteString
 
 type NarSubDir = "nar" :> Capture "filename" String :> Get '[OctetStream] LBS.ByteString
 type NixCacheInfo = "nix-cache-info" :> Get '[OctetStream] LBS.ByteString
 type ShutdownUrl = "shutdown" :> Get '[OctetStream] LBS.ByteString
-type UserAPI1 = "users" :> Raw
+--type UserAPI1 = "users" :> Raw
 
 
 handleNarInfo :: CacheCache -> NarInfoRestriction -> Handler LBS.ByteString
@@ -262,7 +230,7 @@ main = do
       , (True, "iohk-nix-cache.s3-eu-central-1.amazonaws.com", 443, CacheNarSub)
       ] manager
   unlessM (doesDirectoryExist "cachedir") (createDirectory "cachedir")
-  print "started"
+  logMsg @String "started"
   child <- forkIO $ startHelper cache shutdownMVar
   takeMVar shutdownMVar
   logMsg @String "shutting down..."
@@ -283,7 +251,7 @@ fetch cache (NarInfo hash') = do
       logMsg @String "cache hit miss"
       return NotFound
     Nothing -> do
-      map' <- readTVarIO $ narinfoCache cache
+      -- map' <- readTVarIO $ narinfoCache cache
       logMsg @String "cache miss" -- , cache size: " <> show (HM.size map')
       reply <- fetch' cache (NarInfo hash')
       case reply of
@@ -313,9 +281,12 @@ rateToString :: Integral i => i -> Double -> String
 rateToString size spent = do
   let
     rate = (fromIntegral size) / spent
-    go x | x >= 0 && x <= 1024 = (show $ floor x) <> " bytes/second"
-         | x <= (1024*1024) = (show $ floor (x/1024)) <> " kbytes/second"
-         | otherwise = (show $ floor (x/1024/1024)) <> " mbytes/second"
+    int2String :: Integer -> String
+    int2String = show
+    go :: Double -> String
+    go x | x >= 0 && x <= 1024 = (int2String $ floor x) <> " bytes/second"
+         | x <= (1024*1024) = (int2String $ floor (x/1024)) <> " kbytes/second"
+         | otherwise = (int2String $ floor (x/1024/1024)) <> " mbytes/second"
   go rate
 
 fetch' :: CacheCache -> RequestType -> IO ReplyType
@@ -357,30 +328,3 @@ fetch' cache (Nar path) = do
   req <- go (upstreamCaches cache)
   return req
 
-data Chunk = EOF | Chunk !BS.ByteString
-
-foo :: (Monad m) => Context SHA256 -> P.Pipe Chunk (Digest SHA256) m r
-foo ctx = do
-  chunk <- P.await
-  case chunk of
-    EOF -> do
-      P.yield (hashFinalize ctx)
-      bar
-    Chunk bs ->
-      foo (hashUpdate ctx bs)
-
-bar :: (Monad m) => P.Pipe Chunk (Digest SHA256) m r
-bar = do
-  let
-    ctx = hashInit
-  foo ctx
-  bar
-
-
-baz :: IO ()
-baz =
-  P.runEffect ((P.yield (Chunk "foobar") >> P.yield (Chunk "lmao") >> P.yield EOF) >-> bar >-> PP.print)
-
-qux :: IO ()
-qux =
-  print $ show (hash ("foobarlmao"::BS.ByteString) :: Digest SHA256)

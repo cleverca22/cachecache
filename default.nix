@@ -1,7 +1,26 @@
 { pkgs }:
 
 let
-  ghc = pkgs.haskell.packages.ghc844.ghcWithPackages (ps: with ps; [ aeson-compat servant-server wai warp flow bits-bytestring pipes-wai pipes-bytestring pipes-concurrency pipes-async async pipes cryptonite haxl timeit extra http-client-tls lens ]);
+  ghc = pkgs.haskellPackages.ghcWithPackages (ps: with ps; [
+    #aeson-compat
+    servant-server
+    #wai
+    #warp
+    #flow
+    #bits-bytestring
+    #pipes-wai
+    pipes-bytestring
+    pipes-concurrency
+    #pipes-async
+    async
+    pipes
+    #cryptonite
+    #haxl
+    timeit
+    extra
+    http-client-tls
+    lens
+  ]);
 in pkgs.stdenv.mkDerivation {
   name = "cachecache";
   buildInputs = [ ghc ] ++ (with pkgs.haskellPackages; [ stylish-haskell ghcid hlint ]);
