@@ -1,25 +1,31 @@
 { pkgs }:
 
 let
-  ghc = pkgs.haskellPackages.ghcWithPackages (ps: with ps; [
+  myHsPkgs = pkgs.haskellPackages.override {
+    overrides = hself: hsuper: {
+      prometheus = pkgs.haskell.lib.doJailbreak hsuper.prometheus;
+    };
+  };
+  ghc = myHsPkgs.ghcWithPackages (ps: with ps; [
     #aeson-compat
-    servant-server
+    #bits-bytestring
+    #cryptonite
+    #flow
+    #haxl
+    #pipes-async
+    #pipes-wai
     #wai
     #warp
-    #flow
-    #bits-bytestring
-    #pipes-wai
-    pipes-bytestring
-    pipes-concurrency
-    #pipes-async
     async
-    pipes
-    #cryptonite
-    #haxl
-    timeit
     extra
     http-client-tls
     lens
+    pipes
+    pipes-bytestring
+    pipes-concurrency
+    prometheus
+    servant-server
+    timeit
   ]);
 in pkgs.stdenv.mkDerivation {
   name = "cachecache";

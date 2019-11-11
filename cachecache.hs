@@ -9,6 +9,9 @@
 
 module Main (main, rateToString) where
 
+import           LogUtils                 (logMsg)
+import           Types
+
 import           Control.Concurrent.STM
                  (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar)
 import           Control.Monad
@@ -30,7 +33,7 @@ import           GHC.TypeLits             (KnownSymbol, Symbol, symbolVal)
 import           Network.Wai              (Application)
 import           Network.Wai.Handler.Warp (defaultSettings, setPort, runSettings, setTimeout)
 import           Network.HTTP.Client.TLS  (tlsManagerSettings)
-import           Network.HTTP.Client      (newManager, Manager, httpLbs, host, path, defaultRequest, secure, port, Response, responseStatus, responseBody)
+import           Network.HTTP.Client      (newManager, Manager, managerResponseTimeout, httpLbs, host, path, defaultRequest, secure, port, Response, responseStatus, responseBody, responseTimeoutMicro)
 import           Network.HTTP.Types.Status (statusCode)
 import           Servant
                  ((:<|>) (..), (:>), Capture, FromHttpApiData, Get, Handler,
@@ -47,8 +50,13 @@ import           System.TimeIt            (timeItT)
 import           System.Directory         (doesDirectoryExist, createDirectory, doesFileExist)
 --import qualified Testing                  as T
 import           System.IO.Error          (isAlreadyInUseError)
-import           LogUtils                 (logMsg)
 import           Control.Monad.Extra      (unlessM)
+
+import           System.Metrics.Prometheus.Concurrent.RegistryT
+import qualified System.Metrics.Prometheus.Metric.Counter as Counter
+import           System.Metrics.Prometheus.Http.Scrape
+import           Control.Concurrent.Async
+import           Control.Monad.Trans.Reader
 
 --------------------------------------------------------------------------------
 
@@ -86,6 +94,7 @@ data CacheCache
   { narinfoCache :: TVar (HM.HashMap LT.Text NarInfoCacheEntry)
   , upstreamCaches :: [ (Bool, BS.ByteString, Int, CacheStyle) ]
   , manager :: Manager
+  , cacheMetrics :: Metrics
   }
 
 data RequestType
@@ -167,20 +176,30 @@ type ShutdownUrl = "shutdown" :> Get '[OctetStream] LBS.ByteString
 
 
 handleNarInfo :: CacheCache -> NarInfoRestriction -> Handler LBS.ByteString
-handleNarInfo cache NarInfoRestriction{textHash} = do
-    when (LT.length textHash /= 32) $ throwError $ err500 { errBody = "invalid query" }
-    rep <- liftIO $ fetch cache $ NarInfo textHash
-    case rep of
-      Found bs -> return bs
-      NotFound -> throwError $ err404 { errBody = "file not found" }
-      ServerError -> throwError $ err500 { errBody = "internal error" }
+handleNarInfo cache@CacheCache{cacheMetrics} NarInfoRestriction{textHash} = do
+  when (LT.length textHash /= 32) $ throwError $ err500 { errBody = "invalid query" }
+  liftIO $ Counter.inc $ metricRequestsServed cacheMetrics
+  rep <- liftIO $ fetch cache $ NarInfo textHash
+  case rep of
+    Found bs -> do
+      liftIO $ Counter.inc $ metricInfoHit cacheMetrics
+      return bs
+    NotFound -> do
+      liftIO $ Counter.inc $ metricInfoMiss cacheMetrics
+      throwError $ err404 { errBody = "file not found" }
+    ServerError -> throwError $ err500 { errBody = "internal error" }
 
 handleNarSubDir :: CacheCache -> String -> Handler LBS.ByteString
-handleNarSubDir cache name = do
+handleNarSubDir cache@CacheCache{cacheMetrics} name = do
+  liftIO $ Counter.inc $ metricRequestsServed cacheMetrics
   res <- liftIO $ fetch cache $ Nar $ LT.pack name
   case res of
-    Found lbs -> return lbs
-    NotFound -> throwError $ err404 { errBody = "file not found" }
+    Found lbs -> do
+      liftIO $ Counter.inc $ metricNarHit cacheMetrics
+      return lbs
+    NotFound -> do
+      liftIO $ Counter.inc $ metricNarMiss cacheMetrics
+      throwError $ err404 { errBody = "file not found" }
     ServerError -> throwError $ err500 { errBody = "internal error" }
 
 handleNixCacheInfo :: Handler LBS.ByteString
@@ -218,17 +237,37 @@ startHelper cache shutdownMVar =
           startHelper cache shutdownMVar
         else putMVar shutdownMVar ()
 
+registerMetricsServer :: IO (Metrics, Async ())
+registerMetricsServer = runRegistryT $ do
+  metrics <- makeMetrics
+  registry <- RegistryT ask
+  server <- liftIO . async $ runReaderT (unRegistryT $ serveHttpTextMetricsT 8080 []) registry
+  pure (metrics, server)
+
+makeMetrics :: RegistryT IO Metrics
+makeMetrics = Metrics
+  <$> registerCounter "requests_served" mempty
+  <*> registerCounter "narinfo_hit" mempty
+  <*> registerCounter "narinfo_miss" mempty
+  <*> registerCounter "nar_hit" mempty
+  <*> registerCounter "nar_miss" mempty
+  <*> registerCounter "nar_bytes_hit" mempty
+  <*> registerCounter "nar_bytes_miss" mempty
+
 main :: IO ()
 main = do
+  (metrics, metricServer) <- registerMetricsServer
   t1 <- newTVarIO HM.empty
   shutdownMVar <- newEmptyMVar
-  manager <- newManager tlsManagerSettings
+  let
+    customSettings = tlsManagerSettings { managerResponseTimeout = responseTimeoutMicro $ 60 * 1000000 }
+  manager <- newManager customSettings
   let
     cache :: CacheCache
     cache = CacheCache t1 [
         (True, "cache.nixos.org", 443, CacheNarSub)
       , (True, "iohk-nix-cache.s3-eu-central-1.amazonaws.com", 443, CacheNarSub)
-      ] manager
+      ] manager metrics
   unlessM (doesDirectoryExist "cachedir") (createDirectory "cachedir")
   logMsg @String "started"
   child <- forkIO $ startHelper cache shutdownMVar
@@ -267,11 +306,14 @@ fetch cache (Nar path) = do
   hit <- doesFileExist (LT.unpack $ "cachedir/" <> path)
   if hit then do
     rawdata <- LBS.readFile (LT.unpack $ "cachedir/" <> path)
+    Counter.add (fromIntegral $ LBS.length rawdata) (metricNarBytesHit . cacheMetrics $ cache)
     return $ Found rawdata
   else do
     result <- fetch' cache $ Nar path
     case result of
-      Found rawdata -> LBS.writeFile (LT.unpack $ "cachedir/" <> path) rawdata
+      Found rawdata -> do
+        Counter.add (fromIntegral $ LBS.length rawdata) (metricNarBytesMiss . cacheMetrics $ cache)
+        LBS.writeFile (LT.unpack $ "cachedir/" <> path) rawdata
       _ -> return ()
     return result
 
