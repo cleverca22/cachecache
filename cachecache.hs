@@ -241,7 +241,7 @@ registerMetricsServer :: IO (Metrics, Async ())
 registerMetricsServer = runRegistryT $ do
   metrics <- makeMetrics
   registry <- RegistryT ask
-  server <- liftIO . async $ runReaderT (unRegistryT $ serveHttpTextMetricsT 8080 []) registry
+  server <- liftIO . async $ runReaderT (unRegistryT $ serveMetricsT 8080 []) registry
   pure (metrics, server)
 
 makeMetrics :: RegistryT IO Metrics
