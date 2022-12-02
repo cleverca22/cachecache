@@ -266,7 +266,7 @@ main = do
     cache :: CacheCache
     cache = CacheCache t1 [
         (True, "cache.nixos.org", 443, CacheNarSub)
-      , (True, "iohk-nix-cache.s3-eu-central-1.amazonaws.com", 443, CacheNarSub)
+      , (True, "cache.iog.io", 443, CacheNarSub)
       ] manager metrics
   unlessM (doesDirectoryExist "cachedir") (createDirectory "cachedir")
   logMsg @String "started"
