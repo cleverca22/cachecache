@@ -1,6 +1,7 @@
 { pkgs }:
 
 let
+  inherit (pkgs) lib stdenv;
   myHsPkgs = pkgs.haskellPackages.override {
     overrides = hself: hsuper: {
       prometheus = pkgs.haskell.lib.doJailbreak hsuper.prometheus;
@@ -29,13 +30,20 @@ let
   ]);
 in pkgs.stdenv.mkDerivation {
   name = "cachecache";
-  buildInputs = [ ghc ] ++ (with pkgs.haskellPackages; [ stylish-haskell ghcid hlint ]);
+
+  # Workaround for https://github.com/NixOS/nixpkgs/issues/140774 on aarch64-darwin
+  buildInputs = [ ghc ]
+    ++ pkgs.lib.optional (!(stdenv.targetPlatform.isDarwin && stdenv.targetPlatform.isAarch64))
+    (with pkgs.haskellPackages; [ stylish-haskell ghcid hlint ]);
+
   shellHook = ''
     buildAll() {
       ghc cachecache.hs -o cachecache -Wall -threaded -rtsopts
     }
   '';
+
   src = pkgs.lib.cleanSource ./.;
+
   installPhase = ''
     mkdir -p $out/bin/
     ghc -Wall -threaded ./cachecache.hs -o $out/bin/cachecache
